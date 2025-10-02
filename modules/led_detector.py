@@ -1,3 +1,8 @@
+"""
+Abandoned module for detecting and tracking flashing LEDs.
+Bugs remain unaddressed.
+"""
+
 import cv2
 import numpy as np
 from collections import deque

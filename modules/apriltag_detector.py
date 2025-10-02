@@ -81,7 +81,7 @@ class AprilTagDetector:
                     imagePoints=det.corners.astype(np.float32),
                     cameraMatrix=self.camera_matrix,
                     distCoeffs=self.dist_coeffs,  # 使用标定得到的畸变系数
-                    flags=cv2.SOLVEPNP_IPPE_SQUARE
+                    flags=cv2.SOLVEPNP_ITERATIVE
                 )
 
                 if ret:  # 位姿解算成功
@@ -181,12 +181,10 @@ class AprilTagDetector:
         }
 
 
-# 使用示例
 if __name__ == "__main__":
-    # 配置参数
-    TAG_SIZE = 0.1  # 标签实际边长（米），根据你的标签修改
+    TAG_SIZE = 0.03  # 标签实际边长（米）
     CALIB_FILE = "camera_calibration.npz"  # 标定结果文件
-    TEST_IMAGE = "test_image.jpg"  # 测试图像路径
+    TEST_IMAGE = "test_image_1920_1080.jpg"  # 测试图像路径
 
     # 从标定文件创建检测器
     detector = AprilTagDetector.from_calibration_file(
@@ -194,30 +192,31 @@ if __name__ == "__main__":
         tag_family="tag36h11",
         tag_size=TAG_SIZE
     )
+    # print("[apriltag_detector] Camera matrix:", detector.camera_matrix)
+    # print("[apriltag_detector] Dist coeffs:", detector.dist_coeffs)
+
 
     # 读取测试图像
     image = cv2.imread(TEST_IMAGE)
     if image is None:
-        print(f"无法读取图像: {TEST_IMAGE}")
+        print(f"[apriltag_detector] 无法读取图像: {TEST_IMAGE}")
         exit()
 
     # 检测标签
     detections = detector.detect_tags(image)
-    print(f"检测到 {len(detections)} 个标签")
+    print(f"[apriltag_detector] 检测到 {len(detections)} 个标签")
 
     # 分析并打印结果
     for det in detections:
-        print(f"\n标签 ID: {det['id']}")
-        print(f"中心坐标: {det['center']}")
+        print(f"[apriltag_detector] 标签 ID: {det['id']}")
+        print(f"[apriltag_detector] 中心坐标: {det['center']}")
         
         if det["pose"] is not None:
             pose_info = detector.analyze_pose(det["pose"])
-            print(f"距离相机: {pose_info['distance']:.3f} 米")
-            print(f"欧拉角 (roll, pitch, yaw): {pose_info['euler_angles_deg']:.2f} 度")
-            print(f"平移向量 (x, y, z): {pose_info['translation']:.3f} 米")
+            print(f"[apriltag_detector] 距离相机: {pose_info['distance']:.3f} 米")
+            # print(f"[apriltag_detector] 欧拉角 (roll, pitch, yaw): {pose_info['euler_angles_deg']:.2f} 度")
+            # print(f"[apriltag_detector] 平移向量 (x, y, z): {pose_info['translation']:.3f} 米")
 
     # 绘制结果并显示
     result_img = detector.draw_detections(image, detections)
-    cv2.imshow("AprilTag Detection", cv2.resize(result_img, (1280, 720)))
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    cv2.imwrite("test_result_1920_1080.jpg", result_img)

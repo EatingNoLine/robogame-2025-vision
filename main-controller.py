@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import time
 from modules import AprilTagDetector, LEDDetector
 
 from config import CAMERA_CONFIG
@@ -28,6 +29,7 @@ class MainController:
         """初始化摄像头/视频流"""
         cam_source = self.device_index
         self.cap = cv2.VideoCapture(cam_source)
+        cv2.imwrite("initial_frame.jpg", self.cap.read()[1])
         if not self.cap.isOpened():
             raise RuntimeError(f"无法打开摄像头/视频：{cam_source}")
         # 设置摄像头分辨率
@@ -43,14 +45,14 @@ class MainController:
             tag_size=self.config["tag_size"]
         )
         # 2. LED检测器
-        self.led_detector = LEDDetector()
+        # self.led_detector = LEDDetector()
 
     def _process_single_frame(self, frame):
-        """处理单帧：并行执行两种检测，融合结果"""
+        """处理单帧"""
         display_mode = self.config.get("display_mode", "both")
         result_frame = frame.copy()
 
-        # 1. 执行检测（顺序可互换，无依赖）
+        # 1. 执行检测
         if display_mode in ["both", "apriltag"]:
             april_tag_results = self.april_tag_detector.detect_tags(frame)
         if display_mode in ["both", "led"]:
@@ -71,10 +73,10 @@ class MainController:
             result_frame, f"FPS: {int(fps)} | Mode: {display_mode}",
             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2
         )
+        # cv2.imwrite("processed_frame.jpg", result_frame)
         return result_frame, april_tag_results if "april_tag_results" in locals() else None
 
     def start(self):
-        """启动主流程"""
         print("main-controller start")
         self.running = True
         current_mode = self.config.get("display_mode", "both")
@@ -92,6 +94,7 @@ class MainController:
 
             # 3. 显示结果
             cv2.imshow("AprilTag + LED Detector", cv2.resize(result_frame, (1280, 720)))
+            # print(f"AprilTag Detections: {april_tag_results}")
 
         # 5. 释放资源
         self.cap.release()
@@ -103,23 +106,23 @@ class MainController:
         # 可扩展：返回AprilTag位姿、LED闪烁状态等
         return {
             "april_tag": self.april_tag_detector.detections if hasattr(self.april_tag_detector, "detections") else None,
-            "led_states": self.led_detector.led_states
+            # "led_states": self.led_detector.led_states
         }
 
 CONFIGS = {
     0: {
         "camera_index": 0,
         "calib_file": "camera_calibration.npz",
-        "tag_size": 0.1,  # AprilTag实际边长（米）
+        "tag_size": 0.03,  # AprilTag实际边长（米）
         "tag_family": "tag36h11",
         "display_mode": "apriltag"  # 初始显示模式
     },
     1: {
         "camera_index": 1,
         "calib_file": "camera_calibration.npz",
-        "tag_size": 0.1,
+        "tag_size": 0.03,
         "tag_family": "tag36h11",
-        "display_mode": "both"
+        "display_mode": "apriltag"
     }
 }
 
