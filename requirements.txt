@@ -1,0 +1,6 @@
+numpy>=1.24,<3
+opencv-python>=4.8,<5
+pupil-apriltags>=1.0.4
+
+# On ARM Linux where pupil-apriltags has no wheel, install the alternative
+# backend instead:  pip install numpy opencv-python apriltag

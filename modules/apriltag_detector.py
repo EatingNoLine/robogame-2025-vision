@@ -1,222 +1,280 @@
+"""AprilTag detection and 6-DoF pose estimation.
+
+The detector supports both common Python AprilTag backends:
+
+* ``pupil-apriltags`` (prebuilt wheels, recommended on desktop platforms)
+* ``apriltag`` (the original SWATbotics wrapper, often used on Linux/ARM)
+
+Only one of them needs to be installed.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
 import cv2
-import apriltag
 import numpy as np
 
 
+def _import_backend() -> Any:
+    """Import whichever AprilTag Python binding is available."""
+    try:
+        import pupil_apriltags as backend  # type: ignore[import-not-found]
+
+        return backend
+    except ImportError:
+        pass
+
+    try:
+        import apriltag as backend  # type: ignore[import-not-found]
+
+        return backend
+    except ImportError as exc:
+        raise ImportError(
+            "No AprilTag backend is installed. Install one of:\n"
+            "  pip install pupil-apriltags   # prebuilt wheels\n"
+            "  pip install apriltag          # source build, common on ARM Linux"
+        ) from exc
+
+
 class AprilTagDetector:
-    """
-    集成相机标定参数的AprilTag识别与位姿分析类
-    功能：检测图像中的AprilTag，使用标定参数计算更精确的位姿
+    """Detect AprilTags and estimate their pose relative to the camera.
+
+    Args:
+        tag_family: AprilTag family, e.g. ``"tag36h11"``.
+        tag_size: Edge length of the black tag square, in metres.
+        camera_matrix: 3x3 camera intrinsic matrix. If omitted, poses are not
+            computed and only the 2D tag geometry is returned.
+        dist_coeffs: Camera distortion coefficients.
     """
 
-    def __init__(self, tag_family="tag36h11", tag_size=0.1, 
-                 camera_matrix=None, dist_coeffs=None):
-        """
-        初始化检测器，使用相机标定参数
-        
-        Args:
-            tag_family (str): AprilTag标签家族
-            tag_size (float): 实际标签边长（米）
-            camera_matrix (np.ndarray): 相机内参矩阵 (3x3)
-            dist_coeffs (np.ndarray): 畸变系数 (1x5)
-        """
-        # 初始化AprilTag检测器
-        self.detector = apriltag.Detector(apriltag.DetectorOptions(families=tag_family))
-        
-        # 核心参数配置
+    def __init__(
+        self,
+        tag_family: str = "tag36h11",
+        tag_size: float = 0.03,
+        camera_matrix: np.ndarray | None = None,
+        dist_coeffs: np.ndarray | None = None,
+    ) -> None:
+        backend = _import_backend()
+
+        # pupil-apriltags takes keyword arguments; the SWATbotics wrapper uses
+        # a DetectorOptions object.
+        if hasattr(backend, "DetectorOptions"):
+            options = backend.DetectorOptions(families=tag_family)
+            self.detector = backend.Detector(options)
+        else:
+            self.detector = backend.Detector(families=tag_family)
+
         self.tag_family = tag_family
-        self.tag_size = tag_size
-        self.camera_matrix = camera_matrix  # 相机内参矩阵
-        self.dist_coeffs = dist_coeffs if dist_coeffs is not None else np.zeros((5, 1))  # 畸变系数
-        
-        # 提取内参参数
+        self.tag_size = float(tag_size)
+        self.camera_matrix = (
+            np.asarray(camera_matrix, dtype=np.float64)
+            if camera_matrix is not None
+            else None
+        )
+        self.dist_coeffs = (
+            np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1)
+            if dist_coeffs is not None
+            else np.zeros((5, 1), dtype=np.float64)
+        )
+
         if self.camera_matrix is not None:
-            self.fx = self.camera_matrix[0, 0]
-            self.fy = self.camera_matrix[1, 1]
-            self.cx = self.camera_matrix[0, 2]
-            self.cy = self.camera_matrix[1, 2]
+            if self.camera_matrix.shape != (3, 3):
+                raise ValueError("camera_matrix must be a 3x3 matrix")
+            self.fx = float(self.camera_matrix[0, 0])
+            self.fy = float(self.camera_matrix[1, 1])
+            self.cx = float(self.camera_matrix[0, 2])
+            self.cy = float(self.camera_matrix[1, 2])
         else:
             self.fx = self.fy = self.cx = self.cy = None
 
-        # 标签四个角点的3D坐标（相对于标签中心）
-        half_size = self.tag_size / 2.0
-        self.tag_3d_points = np.array([
-            [-half_size, -half_size, 0],  # 左上角
-            [half_size, -half_size, 0],   # 右上角
-            [half_size, half_size, 0],    # 右下角
-            [-half_size, half_size, 0]    # 左下角
-        ], dtype=np.float32)
+        # 3-D coordinates of the four tag corners, centred on the tag.
+        half = self.tag_size / 2.0
+        self.tag_3d_points = np.array(
+            [
+                [-half, -half, 0.0],
+                [half, -half, 0.0],
+                [half, half, 0.0],
+                [-half, half, 0.0],
+            ],
+            dtype=np.float32,
+        )
 
     @classmethod
-    def from_calibration_file(cls, calib_file, tag_family="tag36h11", tag_size=0.1):
-        """从标定文件创建检测器实例"""
-        calib_data = np.load(calib_file)
-        camera_matrix = calib_data["camera_matrix"]
-        dist_coeffs = calib_data["dist_coeffs"]
+    def from_calibration_file(
+        cls,
+        calib_file: str | Path,
+        tag_family: str = "tag36h11",
+        tag_size: float = 0.03,
+    ) -> "AprilTagDetector":
+        """Create a detector from a ``.npz`` file written by the calibration script."""
+        path = Path(calib_file)
+        if not path.is_file():
+            raise FileNotFoundError(f"Calibration file not found: {path}")
+
+        with np.load(path) as data:
+            missing = {"camera_matrix", "dist_coeffs"} - set(data.files)
+            if missing:
+                raise KeyError(
+                    f"{path} is missing {sorted(missing)}; "
+                    "regenerate it with scripts/calibrate.py"
+                )
+            camera_matrix = data["camera_matrix"].copy()
+            dist_coeffs = data["dist_coeffs"].copy()
+
         return cls(tag_family, tag_size, camera_matrix, dist_coeffs)
 
-    def detect_tags(self, image):
-        """检测图像中的AprilTag并计算位姿"""
-        # 转换为灰度图
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    def detect_tags(self, image: np.ndarray) -> list[dict[str, Any]]:
+        """Detect tags in a BGR or grayscale image.
 
-        # 执行标签检测
+        Returns one dict per tag with ``id``, ``center``, ``corners`` and
+        ``pose``. ``pose`` is ``None`` when no calibration was supplied.
+        """
+        if image is None:
+            raise ValueError("image is None")
+
+        if image.ndim == 3:
+            code = (
+                cv2.COLOR_BGR2GRAY
+                if image.shape[2] == 3
+                else cv2.COLOR_BGRA2GRAY
+            )
+            gray = cv2.cvtColor(image, code)
+        else:
+            gray = image
+        if gray.dtype != np.uint8:
+            gray = cv2.convertScaleAbs(gray)
+
         detections = self.detector.detect(gray)
+        results: list[dict[str, Any]] = []
 
-        # 解析检测结果并计算位姿
-        results = []
         for det in detections:
-            # 提取标签核心信息
-            tag_id = int(det.tag_id)
-            center = tuple(det.center.astype(int))
-            corners = det.corners.astype(int)
-            corners = [tuple(pt) for pt in corners]
-
-            # 位姿解算（仅当提供相机内参时）
+            corners_float = np.asarray(det.corners, dtype=np.float32)
             pose = None
+
             if self.camera_matrix is not None:
-                # 求解PnP问题，使用实际畸变系数
-                ret, rvec, tvec = cv2.solvePnP(
+                # ITERATIVE handles the corner ordering returned by both
+                # AprilTag backends; IPPE_SQUARE requires a stricter order.
+                ok, rvec, tvec = cv2.solvePnP(
                     objectPoints=self.tag_3d_points,
-                    imagePoints=det.corners.astype(np.float32),
+                    imagePoints=corners_float,
                     cameraMatrix=self.camera_matrix,
-                    distCoeffs=self.dist_coeffs,  # 使用标定得到的畸变系数
-                    flags=cv2.SOLVEPNP_ITERATIVE
+                    distCoeffs=self.dist_coeffs,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
                 )
+                if ok:
+                    pose = {"rvec": rvec, "tvec": tvec}
 
-                if ret:  # 位姿解算成功
-                    pose = {
-                        "rvec": rvec,  # 旋转向量（3x1，弧度）
-                        "tvec": tvec   # 平移向量（3x1，米）
-                    }
-
-            # 存储单标签结果
-            results.append({
-                "id": tag_id,
-                "center": center,
-                "corners": corners,
-                "pose": pose
-            })
+            results.append(
+                {
+                    "id": int(det.tag_id),
+                    "center": tuple(int(round(v)) for v in det.center),
+                    "corners": [
+                        (int(round(x)), int(round(y))) for x, y in corners_float
+                    ],
+                    "pose": pose,
+                }
+            )
 
         return results
 
-    def draw_detections(self, image, detections):
-        """在图像上绘制检测结果"""
-        output_img = image.copy()
+    def draw_detections(
+        self, image: np.ndarray, detections: list[dict[str, Any]]
+    ) -> np.ndarray:
+        """Return a copy of ``image`` with tag outlines, IDs and pose axes."""
+        output = image.copy()
+
         for det in detections:
-            tag_id = det["id"]
-            center = det["center"]
             corners = det["corners"]
+            center = det["center"]
             pose = det["pose"]
 
-            # 1. 绘制标签框
-            for i in range(4):
-                start_pt = corners[i]
-                end_pt = corners[(i + 1) % 4]
-                cv2.line(output_img, start_pt, end_pt, color=(0, 255, 0), thickness=2)
+            for index in range(4):
+                cv2.line(
+                    output,
+                    corners[index],
+                    corners[(index + 1) % 4],
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+            cv2.circle(output, center, 4, (0, 0, 255), -1, cv2.LINE_AA)
 
-            # 2. 绘制标签中心
-            cv2.circle(output_img, center, radius=4, color=(0, 0, 255), thickness=-1)
-
-            # 3. 绘制标签ID
-            cv2.putText(
-                output_img,
-                f"ID: {tag_id}",
-                (center[0] - 20, center[1] + 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 0, 0),
-                2
-            )
-
-            # 4. 绘制位姿轴（使用畸变系数）
             if pose is not None and self.camera_matrix is not None:
-                # 绘制坐标轴：x轴（红）、y轴（绿）、z轴（蓝）
-                axis_length = self.tag_size / 2.0
                 cv2.drawFrameAxes(
-                    output_img,
-                    cameraMatrix=self.camera_matrix,
-                    distCoeffs=self.dist_coeffs,  # 使用实际畸变系数
-                    rvec=pose["rvec"],
-                    tvec=pose["tvec"],
-                    length=axis_length,
-                    thickness=2
+                    output,
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    pose["rvec"],
+                    pose["tvec"],
+                    self.tag_size / 2.0,
+                    2,
                 )
 
-        return output_img
+            label = f"ID {det['id']}"
+            pose_info = self.analyze_pose(pose)
+            if pose_info is not None:
+                label += f"  {pose_info['distance'] * 100.0:.1f} cm"
 
-    def analyze_pose(self, pose):
-        """解析位姿数据，转换为更易理解的形式"""
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+            )
+            min_x = min(point[0] for point in corners)
+            min_y = min(point[1] for point in corners)
+            origin = (
+                max(min_x, 4),
+                max(min_y - 10, text_height + 4),
+            )
+            cv2.rectangle(
+                output,
+                (origin[0] - 4, origin[1] - text_height - 4),
+                (origin[0] + text_width + 4, origin[1] + baseline),
+                (0, 0, 0),
+                -1,
+            )
+            cv2.putText(
+                output,
+                label,
+                origin,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        return output
+
+    def analyze_pose(self, pose: dict[str, np.ndarray] | None) -> dict[str, Any] | None:
+        """Convert a pose returned by :meth:`detect_tags` into readable values.
+
+        Euler angles use the Z-Y-X convention and are returned in radians and
+        degrees as ``(roll, pitch, yaw)``.
+        """
         if pose is None:
             return None
 
-        rvec = pose["rvec"]
-        tvec = pose["tvec"]
-
-        # 旋转向量 -> 旋转矩阵
-        rotation_matrix, _ = cv2.Rodrigues(rvec)
-
-        # 旋转矩阵 -> 欧拉角（Z-Y-X顺规，对应yaw-pitch-roll）
-        sy = np.sqrt(rotation_matrix[0,0] **2 + rotation_matrix[1,0]** 2)
+        rotation_matrix, _ = cv2.Rodrigues(pose["rvec"])
+        sy = float(np.hypot(rotation_matrix[0, 0], rotation_matrix[1, 0]))
         singular = sy < 1e-6
 
         if not singular:
-            roll = np.arctan2(rotation_matrix[2,1], rotation_matrix[2,2])
-            pitch = np.arctan2(-rotation_matrix[2,0], sy)
-            yaw = np.arctan2(rotation_matrix[1,0], rotation_matrix[0,0])
+            roll = float(np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2]))
+            pitch = float(np.arctan2(-rotation_matrix[2, 0], sy))
+            yaw = float(np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0]))
         else:
-            roll = np.arctan2(-rotation_matrix[1,2], rotation_matrix[1,1])
-            pitch = np.arctan2(-rotation_matrix[2,0], sy)
+            roll = float(np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1]))
+            pitch = float(np.arctan2(-rotation_matrix[2, 0], sy))
             yaw = 0.0
 
-        # 计算直线距离
-        distance = np.linalg.norm(tvec)
+        translation = np.asarray(pose["tvec"], dtype=np.float64).reshape(3)
+        euler = (roll, pitch, yaw)
 
         return {
             "rotation_matrix": rotation_matrix,
-            "euler_angles": (roll, pitch, yaw),
-            "distance": distance,
-            "euler_angles_deg": np.degrees((roll, pitch, yaw)),  # 角度制
-            "translation": tvec.flatten()  # 平移向量
+            "euler_angles": euler,
+            "euler_angles_deg": tuple(float(v) for v in np.degrees(euler)),
+            "distance": float(np.linalg.norm(translation)),
+            "translation": tuple(float(v) for v in translation),
         }
-
-
-if __name__ == "__main__":
-    TAG_SIZE = 0.03  # 标签实际边长（米）
-    CALIB_FILE = "camera_calibration.npz"  # 标定结果文件
-    TEST_IMAGE = "test_image_1920_1080.jpg"  # 测试图像路径
-
-    # 从标定文件创建检测器
-    detector = AprilTagDetector.from_calibration_file(
-        calib_file=CALIB_FILE,
-        tag_family="tag36h11",
-        tag_size=TAG_SIZE
-    )
-    # print("[apriltag_detector] Camera matrix:", detector.camera_matrix)
-    # print("[apriltag_detector] Dist coeffs:", detector.dist_coeffs)
-
-
-    # 读取测试图像
-    image = cv2.imread(TEST_IMAGE)
-    if image is None:
-        print(f"[apriltag_detector] 无法读取图像: {TEST_IMAGE}")
-        exit()
-
-    # 检测标签
-    detections = detector.detect_tags(image)
-    print(f"[apriltag_detector] 检测到 {len(detections)} 个标签")
-
-    # 分析并打印结果
-    for det in detections:
-        print(f"[apriltag_detector] 标签 ID: {det['id']}")
-        print(f"[apriltag_detector] 中心坐标: {det['center']}")
-        
-        if det["pose"] is not None:
-            pose_info = detector.analyze_pose(det["pose"])
-            print(f"[apriltag_detector] 距离相机: {pose_info['distance']:.3f} 米")
-            # print(f"[apriltag_detector] 欧拉角 (roll, pitch, yaw): {pose_info['euler_angles_deg']:.2f} 度")
-            # print(f"[apriltag_detector] 平移向量 (x, y, z): {pose_info['translation']:.3f} 米")
-
-    # 绘制结果并显示
-    result_img = detector.draw_detections(image, detections)
-    cv2.imwrite("test_result_1920_1080.jpg", result_img)
